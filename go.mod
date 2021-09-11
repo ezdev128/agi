@@ -1,5 +1,5 @@
-module github.com/CyCoreSystems/agi
+module github.com/ezdev128/agi
 
-require github.com/pkg/errors v0.8.1
+go 1.16
 
-go 1.13
+require github.com/pkg/errors v0.9.1

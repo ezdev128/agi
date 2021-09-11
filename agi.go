@@ -82,8 +82,8 @@ type Response struct {
 }
 
 // Res returns the ResultString of a Response, as well as any error encountered.  Depending on the command, this is sometimes more useful than Val()
-func (r *Response) Res() (string,error) {
-  return r.ResultString, r.Error
+func (r *Response) Res() (string, error) {
+	return r.ResultString, r.Error
 }
 
 // Err returns the error value from the response
@@ -496,7 +496,7 @@ func (a *AGI) WaitForDigit(timeout time.Duration) (digit string, err error) {
 	resp := a.Command("WAIT FOR DIGIT", toMSec(timeout))
 	resp.ResultString = ""
 	if resp.Error == nil && strconv.IsPrint(rune(resp.Result)) {
-		resp.ResultString = string(resp.Result)
+		resp.ResultString = string(rune(resp.Result))
 	}
 	return resp.Res()
 }
