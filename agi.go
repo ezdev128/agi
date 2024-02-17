@@ -4,16 +4,16 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/pkg/errors"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // State describes the Asterisk channel state.  There are mapped
@@ -36,7 +36,7 @@ const (
 	// StateRing indicates the channel is ringing
 	StateRing
 
-	// StateRinging indicates the channel's remote end is rining (the channel is receiving ringback)
+	// StateRinging indicates the channel's remote end is ringing (the channel is receiving ringback)
 	StateRinging
 
 	// StateUp indicates the channel is up
@@ -68,7 +68,7 @@ type AGI struct {
 	mu sync.Mutex
 
 	// Logging ability
-	logger *log.Logger
+	logger *zap.Logger
 }
 
 // Response represents a response to an AGI
@@ -98,9 +98,8 @@ func (r *Response) Val() (string, error) {
 
 // Regex for AGI response result code and value
 var responseRegex = regexp.MustCompile(`^([\d]{3})\sresult=(\-?[[:alnum:]]*)(\s.*)?$`)
-
-// ErrHangup indicates the channel hung up during processing
-var ErrHangup = errors.New("hangup")
+var responseRegexNoParse = regexp.MustCompile(`^(\d{3})\sresult=(-?[[:alnum:]_*]*)(\s.*)?$`)
+var responseRegexNoParseOtherResponse = regexp.MustCompile(`^(\d{3})\s([\s\w]+)$`)
 
 const (
 	// StatusOK indicates the AGI command was
@@ -112,7 +111,7 @@ const (
 	StatusInvalid = 510
 
 	// StatusDeadChannel indicates that the command
-	// cannot be performed on a dead (hungup) channel.
+	// cannot be performed on a dead (hangup) channel.
 	StatusDeadChannel = 511
 
 	// StatusEndUsage indicates...TODO
@@ -136,6 +135,7 @@ func NewWithEAGI(r io.Reader, w io.Writer, eagi io.Reader) *AGI {
 		r:         r,
 		w:         w,
 		eagi:      eagi,
+		logger:    zap.New(zapcore.NewNopCore()),
 	}
 
 	s := bufio.NewScanner(a.r)
@@ -180,7 +180,9 @@ func Listen(addr string, handler HandlerFunc) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to bind server")
 	}
-	defer l.Close() // nolint: errcheck
+	defer func(l net.Listener) {
+		_ = l.Close()
+	}(l)
 
 	for {
 		conn, err := l.Accept()
@@ -234,14 +236,14 @@ func (a *AGI) Command(cmd ...string) (resp *Response) {
 				resString += " Err:" + resp.Error.Error()
 			}
 			resString = "{" + strings.TrimSpace(resString) + "}"
-			a.logger.Printf("#%s -> %s -> %s", cmdString, raw, resString)
+			a.logger.Debug(fmt.Sprintf("#%s -> %s -> %s", cmdString, raw, resString))
 		}()
 	}
 
 	_, err := a.w.Write([]byte(cmdString + "\n"))
 	if err != nil {
 		resp.Error = errors.Wrap(err, "failed to send command")
-		return
+		return resp
 	}
 
 	s := bufio.NewScanner(a.r)
@@ -253,21 +255,21 @@ func (a *AGI) Command(cmd ...string) (resp *Response) {
 
 		if strings.HasPrefix(raw, "HANGUP") {
 			resp.Error = ErrHangup
-			return
+			return resp
 		}
 
 		// Parse and store the result code
 		pieces := responseRegex.FindStringSubmatch(raw)
 		if pieces == nil {
 			resp.Error = fmt.Errorf("failed to parse result: %s", raw)
-			return
+			return resp
 		}
 
 		// Status code is the first substring
 		resp.Status, err = strconv.Atoi(pieces[1])
 		if err != nil {
 			resp.Error = errors.Wrap(err, "failed to get status code")
-			return
+			return resp
 		}
 
 		// Result code is the second substring
@@ -287,233 +289,119 @@ func (a *AGI) Command(cmd ...string) (resp *Response) {
 
 	// If the Status code is not 200, return an error
 	if resp.Status != 200 {
-		resp.Error = fmt.Errorf("Non-200 status code")
+		resp.Error = fmt.Errorf("non-200 status code")
 	}
-	return
+
+	return resp
 }
 
-// Answer answers the channel
-func (a *AGI) Answer() error {
-	return a.Command("ANSWER").Err()
-}
+// CommandNoParse sends the given command line to stdout
+// and returns the response.
+// TODO: this does not handle multi-line responses properly
+func (a *AGI) CommandNoParse(cmd ...string) (resp *Response) {
+	resp = &Response{}
+	cmdString := strings.Join(cmd, " ")
+	var raw string
 
-// Status returns the channel status
-func (a *AGI) Status() (State, error) {
-	r, err := a.Command("CHANNEL STATUS").Val()
-	if err != nil {
-		return StateDown, err
-	}
-	state, err := strconv.Atoi(r)
-	if err != nil {
-		return StateDown, fmt.Errorf("Failed to parse state %s", r)
-	}
-	return State(state), nil
-}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-// Exec runs a dialplan application
-func (a *AGI) Exec(cmd ...string) (string, error) {
-	cmd = append([]string{"EXEC"}, cmd...)
-	return a.Command(cmd...).Val()
-}
-
-// Get gets the value of the given channel variable
-func (a *AGI) Get(key string) (string, error) {
-	return a.Command("GET VARIABLE", key).Val()
-}
-
-// GetData plays a file and receives DTMF, returning the received digits
-func (a *AGI) GetData(sound string, timeout time.Duration, maxdigits int) (digits string, err error) {
-	if sound == "" {
-		sound = "silence/1"
-	}
-	resp := a.Command("GET DATA", sound, toMSec(timeout), strconv.Itoa(maxdigits))
-	return resp.Res()
-}
-
-// Hangup terminates the call
-func (a *AGI) Hangup() error {
-	return a.Command("HANGUP").Err()
-}
-
-// RecordOptions describes the options available when recording
-type RecordOptions struct {
-	// Format is the format of the audio file to record; defaults to "wav".
-	Format string
-
-	// EscapeDigits is the set of digits on receipt of which will terminate the recording. Default is "#".  This may not be blank.
-	EscapeDigits string
-
-	// Timeout is the maximum time to allow for the recording.  Defaults to 5 minutes.
-	Timeout time.Duration
-
-	// Silence is the maximum amount of silence to allow before ending the recording.  The finest resolution is to the second.   0=disabled, which is the default.
-	Silence time.Duration
-
-	// Beep controls whether a beep is played before starting the recording.  Defaults to false.
-	Beep bool
-
-	// Offset is the number of samples in the recording to advance before storing to the file.  This is means of clipping the beginning of a recording.  Defaults to 0.
-	Offset int
-}
-
-// Record records audio to a file
-func (a *AGI) Record(name string, opts *RecordOptions) error {
-	if opts == nil {
-		opts = &RecordOptions{}
-	}
-	if opts.Format == "" {
-		opts.Format = "wav"
-	}
-	if opts.EscapeDigits == "" {
-		opts.EscapeDigits = "#"
-	}
-	if opts.Timeout == 0 {
-		opts.Timeout = 5 * time.Minute
-	}
-
-	cmd := strings.Join([]string{
-		"RECORD FILE ",
-		name,
-		opts.Format,
-		opts.EscapeDigits,
-		toMSec(opts.Timeout),
-	}, " ")
-
-	if opts.Offset > 0 {
-		cmd += " " + strconv.Itoa(opts.Offset)
-	}
-
-	if opts.Beep {
-		cmd += " BEEP"
-	}
-
-	if opts.Silence > 0 {
-		cmd += " s=" + toSec(opts.Silence)
-	}
-
-	return a.Command(cmd).Err()
-}
-
-// SayAlpha plays a character string, annunciating each character.
-func (a *AGI) SayAlpha(label string, escapeDigits string) (digit string, err error) {
-	// NOTE: AGI needs empty double quotes hold the place of the empty value in the line
-	if escapeDigits == "" {
-		escapeDigits = `""`
-	}
-	return a.Command("SAY ALPHA", label, escapeDigits).Val()
-}
-
-// SayDigits plays a digit string, annunciating each digit.
-func (a *AGI) SayDigits(number string, escapeDigits string) (digit string, err error) {
-	// NOTE: AGI needs empty double quotes hold the place of the empty value in the line
-	if escapeDigits == "" {
-		escapeDigits = `""`
-	}
-	return a.Command("SAY DIGITS", number, escapeDigits).Val()
-}
-
-// SayDate plays a date
-func (a *AGI) SayDate(when time.Time, escapeDigits string) (digit string, err error) {
-	// NOTE: AGI needs empty double quotes hold the place of the empty value in the line
-	if escapeDigits == "" {
-		escapeDigits = `""`
-	}
-	return a.Command("SAY DATE", toEpoch(when), escapeDigits).Val()
-}
-
-// SayDateTime plays a date using the given format.  See `voicemail.conf` for the format syntax; defaults to `ABdY 'digits/at' IMp`.
-func (a *AGI) SayDateTime(when time.Time, escapeDigits string, format string) (digit string, err error) {
-	// Extract the timezone from the time
-	zone, _ := when.Zone()
-
-	// NOTE: AGI needs empty double quotes hold the place of the empty value in the line
-	if escapeDigits == "" {
-		escapeDigits = `""`
-	}
-
-	// Use the Asterisk default format if we are not given one
-	if format == "" {
-		format = "ABdY 'digits/at' IMp"
-	}
-
-	return a.Command("SAY DATETIME", toEpoch(when), escapeDigits, format, zone).Val()
-}
-
-// SayNumber plays the given number.
-func (a *AGI) SayNumber(number string, escapeDigits string) (digit string, err error) {
-	// NOTE: AGI needs empty double quotes hold the place of the empty value in the line
-	if escapeDigits == "" {
-		escapeDigits = `""`
-	}
-	return a.Command("SAY NUMBER", number, escapeDigits).Val()
-}
-
-// SayPhonetic plays the given phrase phonetically
-func (a *AGI) SayPhonetic(phrase string, escapeDigits string) (digit string, err error) {
-	// NOTE: AGI needs empty double quotes hold the place of the empty value in the line
-	if escapeDigits == "" {
-		escapeDigits = `""`
-	}
-	return a.Command("SAY PHOENTIC", phrase, escapeDigits).Val()
-}
-
-// SayTime plays the time part of the given timestamp
-func (a *AGI) SayTime(when time.Time, escapeDigits string) (digit string, err error) {
-	// NOTE: AGI needs empty double quotes hold the place of the empty value in the line
-	if escapeDigits == "" {
-		escapeDigits = `""`
-	}
-	return a.Command("SAY TIME", toEpoch(when), escapeDigits).Val()
-}
-
-// Set sets the given channel variable to
-// the provided value.
-func (a *AGI) Set(key, val string) error {
-	return a.Command("SET VARIABLE", key, val).Err()
-}
-
-// StreamFile plays the given file to the channel
-func (a *AGI) StreamFile(name string, escapeDigits string, offset int) (digit string, err error) {
-	// NOTE: AGI needs empty double quotes hold the place of the empty value in the line
-	if escapeDigits == "" {
-		escapeDigits = `""`
-	}
-	return a.Command("STREAM FILE", name, escapeDigits, strconv.Itoa(offset)).Val()
-}
-
-// Verbose logs the given message to the verbose message system
-func (a *AGI) Verbose(msg string, level int) error {
-	return a.Command("VERBOSE", strconv.Quote(msg), strconv.Itoa(level)).Err()
-}
-
-// Verbosef logs the formatted verbose output
-func (a *AGI) Verbosef(format string, args ...interface{}) error {
-	return a.Verbose(fmt.Sprintf(format, args...), 9)
-}
-
-// WaitForDigit waits for a DTMF digit and returns what is received
-func (a *AGI) WaitForDigit(timeout time.Duration) (digit string, err error) {
-	resp := a.Command("WAIT FOR DIGIT", toMSec(timeout))
-	resp.ResultString = ""
-	if resp.Error == nil && strconv.IsPrint(rune(resp.Result)) {
-		resp.ResultString = string(rune(resp.Result))
-	}
-	return resp.Res()
-}
-
-// SetLogger setup external logger for low-level logging
-func (a *AGI) SetLogger(l *log.Logger) error {
-	if l != nil && a.logger != nil {
-		return errors.New("Logger already attached")
-	}
-	a.logger = l
-
-	// Output variables
+	// Logging raw command and answer
 	if a.logger != nil {
-		for k, v := range a.Variables {
-			a.logger.Printf("$%s=%s\n", k, v)
-		}
+		defer func() {
+			resString := ""
+			if resp.Error == nil {
+				resString += " Sta:" + strconv.Itoa(resp.Status)
+				resString += " Res:" + strconv.Itoa(resp.Result)
+				if resp.ResultString != "" {
+					resString += " Str:" + resp.ResultString
+				}
+				if resp.Value != "" {
+					resString += " Val:" + resp.Value
+				}
+			} else {
+				resString += " Err:" + resp.Error.Error()
+			}
+			resString = "{" + strings.TrimSpace(resString) + "}"
+			a.logger.Debug(fmt.Sprintf("#%s -> %s -> %s", cmdString, raw, resString))
+		}()
 	}
 
-	return nil
+	_, err := a.w.Write([]byte(cmdString + "\n"))
+	if err != nil {
+		resp.Error = errors.Wrap(err, "failed to send command")
+		return resp
+	}
+
+	s := bufio.NewScanner(a.r)
+	for s.Scan() {
+		raw = s.Text()
+		if raw == "" {
+			break
+		}
+
+		if strings.HasPrefix(raw, "HANGUP") {
+			resp.Error = ErrHangup
+			return resp
+		}
+
+		// Parse and store the result code
+		pieces := responseRegexNoParse.FindStringSubmatch(raw)
+		if pieces == nil {
+			if responseRegexNoParseOtherResponse.MatchString(raw) {
+				pieces = responseRegexNoParseOtherResponse.FindStringSubmatch(raw)
+			} else {
+				resp.Error = fmt.Errorf("failed to parse result: %s", raw)
+				return resp
+			}
+
+		}
+
+		// Status code is the first substring
+		resp.Status, err = strconv.Atoi(pieces[1])
+		if err != nil {
+			resp.Error = errors.Wrap(err, "failed to get status code")
+			return resp
+		}
+
+		// Result code is the second substring
+		resp.ResultString = pieces[2]
+
+		if resp.Status == 511 {
+			if strings.EqualFold(resp.ResultString, "Command Not Permitted on a dead channel or intercept routine") {
+				resp.Error = Err511CommandNotPermitted
+			} else {
+				resp.Error = Err511GenericError
+			}
+			return resp
+		}
+
+		resp.Result, err = strconv.Atoi(pieces[2])
+		if err != nil {
+			resp.Result = 1
+		}
+
+		// Value is the third (and optional) substring
+		wrappedVal := strings.TrimSpace(pieces[3])
+		resp.Value = strings.TrimSuffix(strings.TrimPrefix(wrappedVal, "("), ")")
+
+		if resp.Value == "timeout" {
+			resp.Error = ErrTimeout
+		}
+
+		if resp.Status == 200 && resp.Value == "-1" {
+			resp.Error = ErrHangup
+			return resp
+		}
+
+		// FIXME: handle multiple line return values
+		break // nolint
+	}
+
+	// If the Status code is not 200, return an error
+	if resp.Status != 200 {
+		resp.Error = fmt.Errorf("non-200 status code")
+	}
+
+	return resp
 }

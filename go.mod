@@ -1,5 +1,10 @@
-module github.com/ezdev128/agi
+module agi
 
-go 1.16
+require (
+	github.com/pkg/errors v0.9.1
+	go.uber.org/zap v1.26.0
+)
 
-require github.com/pkg/errors v0.9.1
+require go.uber.org/multierr v1.10.0 // indirect
+
+go 1.20
