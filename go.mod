@@ -1,4 +1,6 @@
-module agi
+module github.com/ezdev128/agi
+
+go 1.20
 
 require (
 	github.com/pkg/errors v0.9.1
@@ -7,4 +9,3 @@ require (
 
 require go.uber.org/multierr v1.10.0 // indirect
 
-go 1.20
