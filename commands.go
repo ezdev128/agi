@@ -6,7 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
+	"errors"
+
 	"go.uber.org/zap"
 )
 

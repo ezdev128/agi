@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -97,21 +96,18 @@ func (r *Response) Val() (string, error) {
 }
 
 // Regex for AGI response result code and value
-var responseRegex = regexp.MustCompile(`^([\d]{3})\sresult=(\-?[[:alnum:]]*)(\s.*)?$`)
+var responseRegex = regexp.MustCompile(`^(\d{3})\sresult=(-?[[:alnum:]]*)(\s.*)?$`)
 var responseRegexNoParse = regexp.MustCompile(`^(\d{3})\sresult=(-?[[:alnum:]_*]*)(\s.*)?$`)
 var responseRegexNoParseOtherResponse = regexp.MustCompile(`^(\d{3})\s([\s\w]+)$`)
 
 const (
-	// StatusOK indicates the AGI command was
-	// accepted.
+	// StatusOK indicates the AGI command was accepted.
 	StatusOK = 200
 
-	// StatusInvalid indicates Asterisk did not
-	// understand the command.
+	// StatusInvalid indicates Asterisk did not understand the command.
 	StatusInvalid = 510
 
-	// StatusDeadChannel indicates that the command
-	// cannot be performed on a dead (hangup) channel.
+	// StatusDeadChannel indicates that the command cannot be performed on a dead (hangup) channel.
 	StatusDeadChannel = 511
 
 	// StatusEndUsage indicates...TODO
@@ -178,7 +174,7 @@ func Listen(addr string, handler HandlerFunc) error {
 
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		return errors.Wrap(err, "failed to bind server")
+		return fmt.Errorf("failed to bind server: %w", err)
 	}
 	defer func(l net.Listener) {
 		_ = l.Close()
@@ -187,7 +183,7 @@ func Listen(addr string, handler HandlerFunc) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			return errors.Wrap(err, "failed to accept TCP connection")
+			return fmt.Errorf("failed to accept TCP connection: %w", err)
 		}
 
 		go handler(NewConn(conn))
@@ -242,7 +238,7 @@ func (a *AGI) Command(cmd ...string) (resp *Response) {
 
 	_, err := a.w.Write([]byte(cmdString + "\n"))
 	if err != nil {
-		resp.Error = errors.Wrap(err, "failed to send command")
+		resp.Error = fmt.Errorf("failed to send command: %w", err)
 		return resp
 	}
 
@@ -268,7 +264,7 @@ func (a *AGI) Command(cmd ...string) (resp *Response) {
 		// Status code is the first substring
 		resp.Status, err = strconv.Atoi(pieces[1])
 		if err != nil {
-			resp.Error = errors.Wrap(err, "failed to get status code")
+			resp.Error = fmt.Errorf("failed to get status code: %w", err)
 			return resp
 		}
 
@@ -276,7 +272,7 @@ func (a *AGI) Command(cmd ...string) (resp *Response) {
 		resp.ResultString = pieces[2]
 		resp.Result, err = strconv.Atoi(pieces[2])
 		if err != nil {
-			resp.Error = errors.Wrap(err, "failed to parse result-code as an integer")
+			resp.Error = fmt.Errorf("failed to parse result-code as an integer: %w", err)
 		}
 
 		// Value is the third (and optional) substring
@@ -329,7 +325,7 @@ func (a *AGI) CommandNoParse(cmd ...string) (resp *Response) {
 
 	_, err := a.w.Write([]byte(cmdString + "\n"))
 	if err != nil {
-		resp.Error = errors.Wrap(err, "failed to send command")
+		resp.Error = fmt.Errorf("failed to send command: %w", err)
 		return resp
 	}
 
@@ -360,7 +356,7 @@ func (a *AGI) CommandNoParse(cmd ...string) (resp *Response) {
 		// Status code is the first substring
 		resp.Status, err = strconv.Atoi(pieces[1])
 		if err != nil {
-			resp.Error = errors.Wrap(err, "failed to get status code")
+			resp.Error = fmt.Errorf("failed to get status code: %w", err)
 			return resp
 		}
 

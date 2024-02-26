@@ -1,7 +1,7 @@
 package agi
 
 import (
-	"github.com/pkg/errors"
+	"errors"
 )
 
 // ErrHangup indicates the channel hung up during processing
